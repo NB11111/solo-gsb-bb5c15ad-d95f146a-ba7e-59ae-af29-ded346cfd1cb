@@ -270,8 +270,40 @@
       <div id="rem-unsupported"></div>
       <div class="toolbar" style="margin-top:12px;align-items:flex-end">
         <input id="rem-note" placeholder="修复说明（可选），如：清理死规则与重复规则" style="flex:1;min-width:260px">
-        <button class="btn primary" id="btn-rem-apply">✔ 应用勾选建议（单事务，失败自动回滚）</button>
+        <button class="btn" id="btn-rem-preview">🧪 影响预演（不落库）</button>
+        <button class="btn primary" id="btn-rem-apply">✔ 应用勾选建议（需先预演，单事务复核令牌，失败自动回滚）</button>
       </div>
+      <p class="hint" style="margin:0">建议先<strong>影响预演</strong>：系统在<strong>不落库</strong>的情况下按确定性应用顺序生成草稿规则，分别用当前规则与草稿规则<strong>从零回放全部已注入告警</strong>（保持注入顺序与冷却状态语义），
+        汇总放行→抑制、抑制→放行及逐条规则归因变化，并签发绑定规则快照 / 建议集合 / 告警集合的<strong>预演令牌</strong>；正式应用会在<strong>同一事务内复核令牌</strong>，任一输入已变化则 409 拒绝且不修改规则。</p>
+    </div>
+
+    <div class="card" style="margin-top:16px;display:none" id="rem-preview-card">
+      <h2>影响预演结果（草稿未落库）
+        <span class="badge" id="pv-alert-count">0 条告警</span>
+        <span class="badge pass" id="pv-before-count"></span>
+        <span class="badge" id="pv-after-count"></span>
+        <span class="badge suppress" id="pv-p2s"></span>
+        <span class="badge pass" id="pv-s2p"></span>
+      </h2>
+      <div id="pv-summary" class="summary"></div>
+      <div id="pv-validation"></div>
+      <div id="pv-results"></div>
+      <div id="pv-attribution"></div>
+      <div id="pv-rules"></div>
+      <details class="pv-detail" open>
+        <summary>逐条告警回放对比（当前规则 → 草稿规则，按注入顺序，冷却从零累积）</summary>
+        <div class="table-wrap">
+          <table>
+            <thead><tr>
+              <th>#</th><th>时间</th><th>设备/批次</th><th>级别/类型</th>
+              <th>当前决定</th><th>当前归因规则</th>
+              <th>草稿决定</th><th>草稿归因规则</th><th>变化</th>
+            </tr></thead>
+            <tbody id="pv-rows"></tbody>
+          </table>
+        </div>
+      </details>
+      <p class="hint" style="margin:8px 0 0">预演令牌已绑定当前规则快照、建议集合与告警集合；<b>不要修改规则或注入/撤销告警</b>，否则应用时将以 409 拒绝并要求重新预演。</p>
     </div>
 
     <div class="card" style="margin-top:16px;display:none" id="rem-result-card">

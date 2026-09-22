@@ -356,3 +356,23 @@ tr.row-dead { background: rgba(248, 113, 113, 0.06); }
   flex-wrap: wrap; align-items: center;
 }
 .rem-history-item .meta { color: var(--muted); font-size: 12.5px; margin-top: 4px; }
+
+/* ---------------- 审计修复：影响预演 ---------------- */
+.pv-ok {
+  border: 1px solid rgba(52,211,153,0.4); background: var(--green-bg);
+  color: var(--green); border-radius: 8px; padding: 8px 12px;
+  font-size: 12.5px; margin: 10px 0;
+}
+.pv-warn {
+  border: 1px solid rgba(248,113,113,0.45); background: var(--red-bg);
+  color: var(--red); border-radius: 8px; padding: 8px 12px;
+  font-size: 12.5px; margin: 10px 0;
+}
+.pv-warn ul { margin: 6px 0 0; padding-left: 18px; }
+.pv-detail { margin-top: 12px; }
+.pv-detail > summary {
+  cursor: pointer; color: var(--accent); font-size: 13px; padding: 4px 0;
+}
+.pv-rules { display: flex; flex-direction: column; gap: 6px; margin-top: 8px; }
+.snap-rule.pv-touched { border-color: var(--amber); box-shadow: inset 0 0 0 1px rgba(251,191,36,0.35); }
+.decision.small { font-size: 11px; padding: 1px 7px; }

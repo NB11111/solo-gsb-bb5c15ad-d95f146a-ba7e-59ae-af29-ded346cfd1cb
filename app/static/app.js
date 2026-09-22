@@ -27,6 +27,7 @@ let state = {
     suggestions: [], unsupported: [], meta: null,
     history: [], canUndoId: null, lastResult: null,
     selected: new Set(),
+    preview: null,
   },
 };
 
@@ -767,9 +768,13 @@ async function loadRemData() {
   state.remediate.unsupported = s.unsupported || [];
   state.remediate.history = h.runs || [];
   state.remediate.canUndoId = h.can_undo_id;
-  // 规则可能已变化：丢弃已失效的勾选
+  // 规则可能已变化：丢弃已失效的勾选与对应的过期预演
   const ids = new Set(state.remediate.suggestions.map((x) => x.id));
   state.remediate.selected = new Set([...state.remediate.selected].filter((x) => ids.has(x)));
+  if (state.remediate.preview) {
+    state.remediate.preview = null;
+    renderPreview();
+  }
   renderRemSuggestions();
   renderRemHistory();
 }
@@ -817,27 +822,185 @@ function renderRemSuggestions() {
     : "";
 }
 
+async function runPreview() {
+  const ids = state.remediate.suggestions
+    .filter((s) => state.remediate.selected.has(s.id))
+    .map((s) => s.id);
+  if (!ids.length) return toast("请先勾选要预演的修复建议", true);
+  try {
+    const pv = await api("/api/rule-audit/preview", {
+      method: "POST",
+      body: JSON.stringify({ suggestion_ids: ids, note: $("#rem-note").value.trim() }),
+    });
+    state.remediate.preview = pv;
+    renderPreview();
+    const r = pv.replay;
+    if (!pv.validation_ok) {
+      toast(`预演完成，但应用后校验预计失败（${pv.validation_errors.length} 项），请调整勾选`, true);
+    } else if (!r.changed_count) {
+      toast(`预演完成：${r.alert_count} 条告警回放结果零变化（${pv.applied_count} 条建议生效）`);
+    } else {
+      toast(`预演完成：${r.suppress_to_pass} 条抑制→放行，${r.pass_to_suppress} 条放行→抑制`);
+    }
+  } catch (e) { fail(e); }
+}
+
+function pvRuleLabel(ruleId, ruleName) {
+  return ruleId == null
+    ? '<span class="badge">默认放行（无命中规则）</span>'
+    : `<span class="seq-chip">#${ruleId} ${esc(ruleName || "")}</span>`;
+}
+
+function pvRuleText(r) {
+  const m = ruleMatches(r);
+  return `设备 ${esc(m.dev)} · 批次 ${esc(m.batch)} · 级别 ${esc(m.lvl)} · 时段 ${esc(m.time)} · 日期 ${esc(m.dates)}`;
+}
+
+function renderPreview() {
+  const pv = state.remediate.preview;
+  const card = $("#rem-preview-card");
+  if (!pv) { card.style.display = "none"; return; }
+  card.style.display = "";
+  const r = pv.replay;
+  $("#pv-alert-count").textContent = `${r.alert_count} 条已注入告警`;
+  $("#pv-before-count").textContent = `当前规则：${r.before_pass} 放 / ${r.before_suppress} 抑`;
+  $("#pv-after-count").textContent = `草稿规则：${r.after_pass} 放 / ${r.after_suppress} 抑`;
+  $("#pv-p2s").textContent = `放行→抑制 ${r.pass_to_suppress}`;
+  $("#pv-s2p").textContent = `抑制→放行 ${r.suppress_to_pass}`;
+
+  const d = pv.audit_diff;
+  $("#pv-summary").innerHTML = r.alert_count === 0
+    ? `当前<strong>没有已注入告警</strong>：本次为<strong>零变化预演</strong>（可直接应用，回放为空）。
+       草稿确定性应用 <b>${pv.applied_count}</b> 条建议 / 跳过 <b>${pv.skipped_count}</b> 条；
+       审计关系 <b>${d.before_totals.overlaps} → ${d.after_totals.overlaps}</b> 组。`
+    : `对全部 <b>${r.alert_count}</b> 条已注入告警按注入顺序、从零冷却状态分别回放：
+       当前规则 <b>${r.before_pass} 放行 / ${r.before_suppress} 抑制</b>，
+       草稿规则 <b>${r.after_pass} 放行 / ${r.after_suppress} 抑制</b>；
+       <b style="color:var(--amber)">放行→抑制 ${r.pass_to_suppress}</b> 条，
+       <b style="color:var(--green)">抑制→放行 ${r.suppress_to_pass}</b> 条，
+       不变 ${r.alert_count - r.changed_count} 条。
+       草稿确定性应用 <b>${pv.applied_count}</b> 条建议 / 跳过 <b>${pv.skipped_count}</b> 条；
+       审计关系 <b>${d.before_totals.overlaps} → ${d.after_totals.overlaps}</b> 组。`;
+
+  $("#pv-validation").innerHTML = pv.validation_ok
+    ? '<div class="pv-ok">✓ 草稿应用后校验预计通过：勾选关系全部消除、无新增可能改变结果的关系、无新增被遮蔽规则。</div>'
+    : `<div class="pv-warn">⚠ 草稿应用后校验预计失败（正式应用将自动回滚、不会改规则）：<ul>${
+        pv.validation_errors.map((x) => `<li>${esc(x)}</li>`).join("")}</ul></div>`;
+
+  $("#pv-results").innerHTML = `
+    <div class="audit-side-title">草稿确定性应用顺序（预览，未落库）</div>
+    <ul class="rem-diff-list">${pv.results.map((x) => `<li>
+      <span class="badge ${x.status === "applied" ? "pass" : ""}">${x.status === "applied" ? "✔ 将应用" : "↷ 将跳过"}</span>
+      <code>${esc(x.suggestion_id)}</code>
+      <div style="color:var(--muted);margin-top:2px">${esc(x.reason)}</div>
+    </li>`).join("")}</ul>`;
+
+  const changedIds = new Set(pv.changed_rule_ids);
+  $("#pv-rules").innerHTML = `
+    <details class="pv-detail" ${pv.deleted_rule_ids.length || changedIds.size ? "open" : ""}>
+      <summary>草稿规则快照（${pv.draft_rules.length} 条；${pv.deleted_rule_ids.length} 条将删除，${changedIds.size} 条被本次草稿触及）</summary>
+      <div class="pv-rules">${pv.draft_rules.map((r) => {
+        const touched = changedIds.has(r.id);
+        return `<div class="snap-rule${touched ? " pv-touched" : ""}">
+          <div class="top">
+            <b>#${r.id} ${esc(r.name)}</b>
+            ${r.action === "pass" ? '<span class="decision pass">pass</span>' : '<span class="decision suppress">suppress</span>'}
+            <span class="badge">优先级 ${r.priority}</span>
+            ${r.enabled ? '<span class="badge pass">启用</span>' : '<span class="badge suppress">草稿中停用</span>'}
+            ${touched ? '<span class="badge" style="color:var(--amber);border-color:var(--amber)">本次草稿触及</span>' : ""}
+          </div>
+          <div class="conds">${pvRuleText(r)}</div>
+        </div>`;
+      }).join("")}</div>
+      ${pv.deleted_rule_ids.length
+        ? `<p class="hint" style="margin:6px 0 0">将删除的规则：${pv.deleted_rule_ids.map((x) => `<b>#${x}</b>`).join("、")}</p>`
+        : ""}
+    </details>`;
+
+  const attr = pv.rule_attribution;
+  $("#pv-attribution").innerHTML = attr.length
+    ? `<div class="audit-side-title">逐条规则归因变化（按规则 id 排序）</div>
+       <div class="table-wrap"><table>
+         <thead><tr><th>归因规则</th><th>当前 放行/抑制</th><th>草稿 放行/抑制</th><th>放行 Δ</th><th>抑制 Δ</th></tr></thead>
+         <tbody>${attr.map((x) => `<tr${x.deleted ? ' class="row-dead"' : ""}>
+           <td>${pvRuleLabel(x.rule_id, x.rule_name)}${x.deleted ? ' <span class="badge suppress">草稿中已删除</span>' : ""}</td>
+           <td>${x.before_pass} / ${x.before_suppress}</td>
+           <td>${x.after_pass} / ${x.after_suppress}</td>
+           <td style="color:${x.pass_delta ? "var(--amber)" : "var(--muted)"}">${x.pass_delta >= 0 ? "+" : ""}${x.pass_delta}</td>
+           <td style="color:${x.suppress_delta ? "var(--amber)" : "var(--muted)"}">${x.suppress_delta >= 0 ? "+" : ""}${x.suppress_delta}</td>
+         </tr>`).join("")}</tbody>
+       </table></div>`
+    : '<div class="audit-side-title">逐条规则归因变化：无（每条告警在两套规则下的归因规则计数均一致）</div>';
+
+  const rows = r.rows;
+  $("#pv-rows").innerHTML = rows.length ? rows.map((x) => {
+    const flipCls = x.flip === "pass_to_suppress" ? "suppress"
+      : x.flip === "suppress_to_pass" ? "pass" : "";
+    const mark = x.decision_changed
+      ? (x.flip === "pass_to_suppress"
+          ? '<span class="diff-mark">放行 → 抑制</span>'
+          : '<span class="diff-mark" style="color:var(--green)">抑制 → 放行</span>')
+      : (x.rule_attribution_changed
+          ? '<span class="no-diff">决定一致 · 归因规则变化</span>'
+          : '<span class="no-diff">一致</span>');
+    return `<tr class="${x.decision_changed ? "row-changed" : ""}">
+      <td>${x.seq}</td>
+      <td style="white-space:nowrap">${esc(x.ts)}</td>
+      <td>${esc(x.device_id || "-")}<br><span style="color:var(--muted)">${esc(x.batch_id || "-")}</span></td>
+      <td>${levelBadge(x.level)}<br><span style="color:var(--muted)">${esc(x.alert_type || "-")}</span></td>
+      <td><span class="decision ${x.before_decision} ${flipCls}">${x.before_decision === "pass" ? "放行" : "抑制"}</span></td>
+      <td>${pvRuleLabel(x.before_rule_id, x.before_rule_name)}<div class="reason-cell" style="max-width:240px;color:var(--muted);font-size:11.5px">${esc(x.before_reason)}</div></td>
+      <td><span class="decision ${x.after_decision}">${x.after_decision === "pass" ? "放行" : "抑制"}</span></td>
+      <td>${pvRuleLabel(x.after_rule_id, x.after_rule_name)}<div class="reason-cell" style="max-width:240px;color:var(--muted);font-size:11.5px">${esc(x.after_reason)}</div></td>
+      <td style="white-space:nowrap">${mark}</td>
+    </tr>`;
+  }).join("") : '<tr><td colspan="9" class="empty">无已注入告警：零变化预演，仍可直接应用</td></tr>';
+}
+
 async function applyRemediations() {
   const ids = state.remediate.suggestions
     .filter((s) => state.remediate.selected.has(s.id))
     .map((s) => s.id);
   if (!ids.length) return toast("请先勾选要应用的修复建议", true);
-  if (!confirm(`在同一事务中应用 ${ids.length} 条修复建议？\n系统会逐条执行并重新审计校验，任一校验失败将自动回滚，规则不会产生任何变化。`)) return;
+  const pv = state.remediate.preview;
+  if (!pv || pv.preview_token == null) {
+    return toast("请先点击「🧪 影响预演」取得预演令牌后再应用", true);
+  }
+  if (pv.validation_errors && pv.validation_errors.length) {
+    return toast("预演显示应用后校验将失败，请调整勾选后重新预演", true);
+  }
+  if (!confirm(`已通过影响预演（${pv.replay.suppress_to_pass} 条抑制→放行，${pv.replay.pass_to_suppress} 条放行→抑制）。\n`
+      + "在同一事务中应用并复核预演令牌？任一输入（规则/建议/告警）已变化将以 409 拒绝且不修改规则。")) return;
   try {
     const r = await api("/api/rule-audit/remediations", {
       method: "POST",
-      body: JSON.stringify({ suggestion_ids: ids, note: $("#rem-note").value.trim() }),
+      body: JSON.stringify({
+        suggestion_ids: ids,
+        preview_token: pv.preview_token,
+        note: $("#rem-note").value.trim(),
+      }),
     });
     $("#rem-note").value = "";
     state.remediate.selected.clear();
+    state.remediate.preview = null;
     state.remediate.lastResult = r;
+    renderPreview();
     await loadRules(); renderRules();
     await refreshAuditIfLoaded();
     await loadRemData();
     renderRemResult();
-    const d = r.diff;
-    toast(`修复 #${r.run_id} 已应用：${r.applied_count} 条生效 / ${r.skipped_count} 条跳过；审计关系 ${d.before_totals.overlaps} → ${d.after_totals.overlaps} 组`);
-  } catch (e) { fail(e); }
+    const d = r.diff, rp = r.preview_replay || { suppress_to_pass: 0, pass_to_suppress: 0 };
+    toast(`修复 #${r.run_id} 已应用：${r.applied_count} 条生效 / ${r.skipped_count} 条跳过；`
+      + `回放影响 抑制→放行 ${rp.suppress_to_pass} / 放行→抑制 ${rp.pass_to_suppress}；`
+      + `审计关系 ${d.before_totals.overlaps} → ${d.after_totals.overlaps} 组`);
+  } catch (e) {
+    fail(e);
+    // 409 令牌失效：预演已过期，清空面板要求重新预演（规则未被修改）
+    if (/409|复核|重新预演/.test(e.message)) {
+      state.remediate.preview = null;
+      renderPreview();
+    }
+  }
 }
 
 function renderRemResult() {
@@ -1162,6 +1325,11 @@ document.addEventListener("change", (e) => {
   else state.remediate.selected.delete(t.dataset.remSelect);
   const card = document.querySelector(`[data-rem-card="${CSS.escape(t.dataset.remSelect)}"]`);
   if (card) card.classList.toggle("selected", t.checked);
+  // 勾选集合是预演令牌的绑定输入之一：变化后旧预演失效，需重新预演
+  if (state.remediate.preview) {
+    state.remediate.preview = null;
+    renderPreview();
+  }
 });
 
 function bind() {
@@ -1212,6 +1380,7 @@ function bind() {
   $("#btn-rem-refresh").addEventListener("click", () =>
     loadRemData().then(() => toast("建议已按当前启用规则重新生成")).catch(fail));
   $("#btn-rem-apply").addEventListener("click", applyRemediations);
+  $("#btn-rem-preview").addEventListener("click", runPreview);
   $("#btn-rem-all").addEventListener("click", () => {
     state.remediate.suggestions.forEach((s) => state.remediate.selected.add(s.id));
     renderRemSuggestions();

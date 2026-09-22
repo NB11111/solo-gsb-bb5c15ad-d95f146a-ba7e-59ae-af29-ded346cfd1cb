@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import json
+import secrets
 import urllib.error
 import urllib.request
 from datetime import datetime
@@ -36,11 +37,13 @@ from .engine import (
     ordered_rules,
 )
 from .remediation import (
+    DryRunError,
     diff_audits,
     generate_suggestions,
     relation_fingerprint,
     validate_remediation,
 )
+from . import preview as preview_mod
 
 app = FastAPI(title="冷链告警抑制策略沙盒", version="1.0.0")
 
@@ -375,6 +378,39 @@ def _audit_and_suggestions(conn):
     return all_rules, audit_result, sugg
 
 
+_PREVIEW_SECRET_KEY = "preview_token_secret"
+
+
+def _preview_secret(conn) -> bytes:
+    """预演令牌的 HMAC 密钥（惰性生成并持久化到 settings）。
+
+    持久化保证容器/进程重启后旧预演令牌仍可复核；密钥不随任何接口暴露。
+    """
+    row = conn.execute(
+        "SELECT value FROM settings WHERE key=?", (_PREVIEW_SECRET_KEY,)
+    ).fetchone()
+    if row and row["value"]:
+        return row["value"].encode("ascii")
+    value = secrets.token_hex(32)
+    conn.execute(
+        "INSERT INTO settings(key, value) VALUES (?, ?) "
+        "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        (_PREVIEW_SECRET_KEY, value),
+    )
+    conn.commit()
+    return value.encode("ascii")
+
+
+def _preview_alerts(conn) -> list[dict]:
+    """已注入告警按注入顺序（seq 升序）加载，ts 还原为 datetime。"""
+    alerts = []
+    for row in conn.execute("SELECT * FROM alerts ORDER BY seq").fetchall():
+        alert = _alert_dict(row)
+        alert["ts"] = datetime.fromisoformat(alert["ts"])
+        alerts.append(alert)
+    return alerts
+
+
 @app.get("/api/rule-audit/suggestions")
 def rule_audit_suggestions():
     """基于当前启用规则的审计关系，生成确定性的合并/收窄/删除/停用建议（只读）。
@@ -392,6 +428,62 @@ def rule_audit_suggestions():
             "suggestions": sugg["suggestions"],
             "unsupported": sugg["unsupported"],
         }
+    finally:
+        conn.close()
+
+
+@app.post("/api/rule-audit/preview")
+def preview_rule_remediation(payload: dict = Body(...)):
+    """影响预演：勾选建议后**不落库**生成草稿规则并从零回放全部已注入告警。
+
+    流程（全部为只读计算，不写入任何规则/告警/决定）：按与正式应用相同的
+    确定性顺序在内存中应用勾选建议得到草稿规则（含跳过语义）→ 分别用当前
+    规则与草稿规则，按注入顺序（seq 升序）、从零冷却状态回放全部已注入
+    告警（注入顺序与冷却窗口语义与策略回放一致）→ 汇总放行→抑制、
+    抑制→放行与逐条规则归因变化。返回绑定**规则快照、建议集合、告警集合、
+    勾选建议与草稿结果**的签名令牌 ``preview_token``，正式应用时必须在
+    同一事务内复核；无已注入告警时仍返回可应用的零变化预演。
+    """
+    selected_ids = (payload or {}).get("suggestion_ids")
+    if not isinstance(selected_ids, list) or not selected_ids:
+        raise HTTPException(400, "suggestion_ids 必须是非空数组")
+    if not all(isinstance(s, str) for s in selected_ids):
+        raise HTTPException(400, "suggestion_ids 必须全部是字符串")
+    note = str((payload or {}).get("note", "")).strip()[:200]
+
+    conn = db.get_conn()
+    try:
+        all_rules, _before, sugg = _audit_and_suggestions(conn)
+        by_id = {s["id"]: s for s in sugg["suggestions"]}
+        unknown = [sid for sid in selected_ids if sid not in by_id]
+        if unknown:
+            raise HTTPException(
+                409, "建议已失效（规则可能已变更），请刷新后重新预演: "
+                + ", ".join(str(s) for s in unknown)
+            )
+        # 去重并保持确定性建议集合中的稳定顺序
+        selected_ordered = list(dict.fromkeys(selected_ids))
+        alerts = _preview_alerts(conn)
+        alerts_rows = conn.execute("SELECT * FROM alerts ORDER BY seq").fetchall()
+        try:
+            result = preview_mod.build_preview(
+                all_rules, sugg["suggestions"], selected_ordered, alerts
+            )
+        except DryRunError as exc:
+            raise HTTPException(409, f"草稿无法应用，请刷新建议后重新预演：{exc}")
+
+        secret = _preview_secret(conn)
+        claims = {
+            "v": 1,
+            "selected": selected_ordered,
+            "rules": preview_mod.rules_digest(all_rules),
+            "suggestions": preview_mod.suggestions_digest(sugg["suggestions"]),
+            "alerts": preview_mod.alerts_digest(alerts_rows),
+            "draft": preview_mod.draft_rules_digest(result["draft_rules"]),
+        }
+        result["preview_token"] = preview_mod.issue_token(secret, claims)
+        result["note"] = note
+        return result
     finally:
         conn.close()
 
@@ -438,6 +530,9 @@ def apply_rule_remediation(payload: dict = Body(...)):
         raise HTTPException(400, "suggestion_ids 必须是非空数组")
     if not all(isinstance(s, str) for s in selected_ids):
         raise HTTPException(400, "suggestion_ids 必须全部是字符串")
+    preview_token = (payload or {}).get("preview_token")
+    if not isinstance(preview_token, str) or not preview_token:
+        raise HTTPException(400, "必须先进行影响预演并携带 preview_token 才能应用")
     note = str((payload or {}).get("note", "")).strip()[:200]
 
     conn = db.get_conn()
@@ -447,20 +542,49 @@ def apply_rule_remediation(payload: dict = Body(...)):
         unknown = [sid for sid in selected_ids if sid not in by_id]
         if unknown:
             raise HTTPException(
-                409, "建议已失效（规则可能已变更），请刷新后重试: "
+                409, "建议已失效（规则可能已变更），请重新预演后重试: "
                 + ", ".join(str(s) for s in unknown)
             )
         wanted = set(selected_ids)
         # 审计结果顺序即确定性应用顺序（按双方规则 id 稳定排序）
         ordered = [s for s in sugg["suggestions"] if s["id"] in wanted]
 
+        # 在事务内、任何规则修改之前复核预演令牌：规则快照 / 建议集合 /
+        # 告警集合 / 勾选建议 / 草稿结果任一已变化，立即 409 并回滚，绝不动规则。
+        alerts_rows = conn.execute("SELECT * FROM alerts ORDER BY seq").fetchall()
+        alerts = []
+        for row in alerts_rows:
+            alert = _alert_dict(row)
+            alert["ts"] = datetime.fromisoformat(alert["ts"])
+            alerts.append(alert)
+        try:
+            pv = preview_mod.build_preview(all_rules, sugg["suggestions"],
+                                          list(dict.fromkeys(selected_ids)), alerts)
+        except DryRunError as exc:
+            raise HTTPException(409, f"预演草稿已无法应用，请重新预演：{exc}")
+
         snapshot = json.dumps(
             [dict(r) for r in conn.execute("SELECT * FROM rules ORDER BY id").fetchall()],
             ensure_ascii=False,
         )
+        secret = _preview_secret(conn)  # 事务前确保密钥就位，避免事务内隐式提交
 
         conn.execute("BEGIN")
         try:
+            expected = {
+                "selected": list(dict.fromkeys(selected_ids)),
+                "rules": preview_mod.rules_digest(all_rules),
+                "suggestions": preview_mod.suggestions_digest(sugg["suggestions"]),
+                "alerts": preview_mod.alerts_digest(alerts_rows),
+                "draft": preview_mod.draft_rules_digest(pv["draft_rules"]),
+            }
+            mismatches = preview_mod.verify_token(secret, preview_token, expected)
+            if mismatches:
+                raise HTTPException(
+                    409, "预演令牌复核失败，请重新进行影响预演后再应用："
+                    + "；".join(mismatches)
+                )
+
             results = []
             working = before
             for s in ordered:
@@ -515,6 +639,8 @@ def apply_rule_remediation(payload: dict = Body(...)):
             "applied_count": sum(1 for r in results if r["status"] == "applied"),
             "skipped_count": sum(1 for r in results if r["status"] == "skipped"),
             "diff": diff,
+            "preview_replay": pv["replay"],
+            "rule_attribution": pv["rule_attribution"],
         }
     finally:
         conn.close()

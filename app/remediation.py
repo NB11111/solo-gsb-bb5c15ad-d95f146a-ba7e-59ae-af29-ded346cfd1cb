@@ -33,6 +33,7 @@ from typing import Any, Optional, Sequence
 
 from . import audit
 from .audit import DAY_MINUTES, TimeDomain
+from .engine import normalize_rule
 
 KIND_LABELS = {
     "delete_rule": "删除死规则",
@@ -491,4 +492,82 @@ def diff_audits(before: dict, after: dict) -> dict:
         "added": added,
         "removed_count": len(removed),
         "added_count": len(added),
+    }
+
+
+# ---------------------------------------------------------------------------
+# 内存态草稿应用（影响预演复用）：与落库应用路径共享同一条确定性顺序与跳过语义
+# ---------------------------------------------------------------------------
+
+class DryRunError(Exception):
+    """草稿在内存态应用时失败（如建议针对的规则已不存在），等价于落库应用的 409。"""
+
+
+def _apply_dry_op(rules: dict[int, dict], op: dict) -> None:
+    """在内存规则表上执行单个修复操作；与 main._apply_remediation_op 语义一致。"""
+    kind = op.get("op")
+    rule_id = int(op.get("rule_id"))
+    if kind == "delete_rule":
+        rules.pop(rule_id, None)
+    elif kind == "disable_rule":
+        if rule_id not in rules:
+            raise DryRunError(f"规则 #{rule_id} 已不存在，修复无法应用")
+        rules[rule_id]["enabled"] = 0
+    elif kind == "update_rule":
+        row = rules.get(rule_id)
+        if row is None:
+            raise DryRunError(f"规则 #{rule_id} 已不存在，修复无法应用")
+        payload = dict(row)
+        payload.update(op.get("set") or {})
+        try:
+            rules[rule_id] = normalize_rule(payload) | {"id": rule_id}
+        except ValueError as exc:
+            raise DryRunError(f"修复操作校验失败（规则 #{rule_id}）：{exc}")
+    else:
+        raise DryRunError(f"未知修复操作: {kind}")
+
+
+def apply_suggestions_dry(
+    rules: Sequence[Any], suggestions: Sequence[dict], selected_ids: Sequence[str]
+) -> dict:
+    """在**内存中**按确定性顺序应用勾选的建议，全程不落库（影响预演专用）。
+
+    与 ``POST /api/rule-audit/remediations`` 的落库路径保持完全一致的应用
+    顺序与跳过语义：按审计关系顺序逐条应用；某条建议针对的关系若已被本次
+    先前的修复消除，则标记为跳过。返回草稿规则（含被删除规则清单）、逐条
+    应用结果与应用后审计。
+    """
+    by_id = {s["id"]: s for s in suggestions}
+    ordered = [by_id[sid] for sid in selected_ids if sid in by_id]
+
+    working_rules: dict[int, dict] = {int(r["id"]): dict(r) for r in rules}
+    before = audit.audit_rules(list(working_rules.values()))
+    working = before
+    results: list[dict] = []
+    for s in ordered:
+        fp = s["relation_fingerprint"]
+        current_fps = {relation_fingerprint(o) for o in working["overlaps"]}
+        if fp not in current_fps:
+            results.append({
+                "suggestion_id": s["id"], "kind": s["kind"],
+                "status": "skipped",
+                "reason": "针对的审计关系已被本次草稿中先前的修复消除",
+            })
+            continue
+        for op in s["ops"]:
+            _apply_dry_op(working_rules, op)
+        working = audit.audit_rules(list(working_rules.values()))
+        results.append({
+            "suggestion_id": s["id"], "kind": s["kind"],
+            "status": "applied",
+            "reason": "已应用：" + "；".join(s["ops_text"]),
+        })
+
+    draft_rules = [working_rules[rid] for rid in sorted(working_rules)]
+    return {
+        "ordered": ordered,
+        "results": results,
+        "draft_rules": draft_rules,
+        "before_audit": before,
+        "after_audit": working,
     }
