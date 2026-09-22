@@ -25,6 +25,12 @@
 冷却差异（cooldown_conflict）需要人工选择保留哪个冷却窗，不生成自动建议，
 在结果中以 ``unsupported`` 单列（除非它同时构成完全遮蔽，此时按完全遮蔽
 给出删除建议）。
+
+影响预演（草稿规则）
+--------------------
+:func:`plan_draft` 在不落库的前提下，按与正式应用**完全相同的确定性顺序**
+把勾选建议应用到内存中的规则副本上，生成草稿规则与重审计结果，供
+"影响预演"分别用当前规则与草稿规则从零回放全部已注入告警。
 """
 from __future__ import annotations
 
@@ -33,6 +39,7 @@ from typing import Any, Optional, Sequence
 
 from . import audit
 from .audit import DAY_MINUTES, TimeDomain
+from .engine import normalize_rule
 
 KIND_LABELS = {
     "delete_rule": "删除死规则",
@@ -492,3 +499,73 @@ def diff_audits(before: dict, after: dict) -> dict:
         "removed_count": len(removed),
         "added_count": len(added),
     }
+
+
+# ---------------------------------------------------------------------------
+# 影响预演：草稿规则的确定性生成（纯函数，不落库）
+# ---------------------------------------------------------------------------
+
+def apply_ops_to_rules(rules: Sequence[Any], ops: Sequence[dict]) -> list[dict]:
+    """把修复操作序列应用到规则 dict 列表的副本上，返回新的规则列表。
+
+    与数据库写入路径语义一致，但只操作内存中的 dict：
+    ``update_rule`` 使用与规则 CRUD 相同的 ``normalize_rule`` 校验；
+    任何校验失败抛 ValueError，由调用方决定回绝方式。
+    """
+    working = [dict(r) for r in rules]
+    for op in ops:
+        kind = op.get("op")
+        rule_id = int(op.get("rule_id"))
+        idx = next((i for i, r in enumerate(working) if int(r["id"]) == rule_id), None)
+        if idx is None:
+            raise ValueError(f"规则 #{rule_id} 已不存在，修复无法应用")
+        if kind == "delete_rule":
+            working.pop(idx)
+        elif kind == "disable_rule":
+            working[idx]["enabled"] = 0
+        elif kind == "update_rule":
+            payload = {**working[idx], **(op.get("set") or {})}
+            data = normalize_rule(payload)  # 与规则 CRUD 相同的校验
+            working[idx].update(data)
+        else:
+            raise ValueError(f"未知修复操作: {kind}")
+    return working
+
+
+def plan_draft(rule_objects: Sequence[Any], audit_result: dict,
+               suggestions: Sequence[dict], selected_ids: Sequence[str]) -> dict:
+    """按实际确定性应用顺序在内存中应用勾选建议，生成草稿规则（不落库）。
+
+    顺序与正式应用完全一致：建议按审计关系的稳定顺序（``suggestions`` 的
+    给定顺序）排列；某条建议针对的关系若已被本次先前的修复消除，则标记为
+    ``skipped`` 且不执行其操作。返回::
+
+        {"ordered": 按确定性顺序排列的勾选建议,
+         "results": 逐条 applied/skipped 结果,
+         "rules":   草稿规则列表（dict）,
+         "audit":   草稿规则的重审计结果}
+    """
+    wanted = set(selected_ids)
+    ordered = [s for s in suggestions if s["id"] in wanted]
+    working_rules = [dict(r) for r in rule_objects]
+    working_audit = audit_result
+    results: list[dict] = []
+    for s in ordered:
+        fp = s["relation_fingerprint"]
+        current_fps = {relation_fingerprint(o) for o in working_audit["overlaps"]}
+        if fp not in current_fps:
+            results.append({
+                "suggestion_id": s["id"], "kind": s["kind"],
+                "status": "skipped",
+                "reason": "针对的审计关系已被本次草稿中先前的修复消除",
+            })
+            continue
+        working_rules = apply_ops_to_rules(working_rules, s["ops"])
+        working_audit = audit.audit_rules(working_rules)
+        results.append({
+            "suggestion_id": s["id"], "kind": s["kind"],
+            "status": "applied",
+            "reason": "已应用：" + "；".join(s["ops_text"]),
+        })
+    return {"ordered": ordered, "results": results,
+            "rules": working_rules, "audit": working_audit}

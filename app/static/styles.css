@@ -356,3 +356,15 @@ tr.row-dead { background: rgba(248, 113, 113, 0.06); }
   flex-wrap: wrap; align-items: center;
 }
 .rem-history-item .meta { color: var(--muted); font-size: 12.5px; margin-top: 4px; }
+
+/* ---------------- 审计修复：影响预演 ---------------- */
+.rem-preview-errors {
+  border: 1px solid rgba(248, 113, 113, 0.4);
+  background: var(--red-bg); color: var(--red);
+  border-radius: 8px; padding: 8px 12px;
+  font-size: 12.5px; margin: 4px 0; width: 100%;
+}
+.pv-transition { font-weight: 700; white-space: nowrap; font-size: 12px; }
+.pv-t-p2s { color: var(--red); }
+.pv-t-s2p { color: var(--green); }
+.pv-t-attr { color: var(--amber); }

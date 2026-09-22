@@ -258,8 +258,11 @@
       <h2>待处理修复建议 <span class="badge" id="rem-pending">0</span></h2>
       <p class="hint">基于「规则审计」的覆盖关系，为<strong>动作冲突 / 完全遮蔽 / 冗余重叠</strong>生成确定性的
         <strong>合并 / 收窄 / 删除 / 停用</strong>建议——同一规则集在任何时刻生成的建议完全一致。
-        勾选建议形成草稿后点击应用：系统在<strong>同一事务</strong>中逐条执行并重新审计校验
-        （勾选的关系必须全部消除、不得新增可能改变结果的关系、不得新增被遮蔽规则），
+        勾选建议后先点 <strong>「🧪 影响预演」</strong>：系统在<strong>不落库</strong>的前提下按实际确定性应用顺序生成草稿规则，
+        并分别用当前规则与草稿规则<strong>从零回放全部已注入告警</strong>（保持注入顺序与冷却状态语义），
+        汇总放行→抑制、抑制→放行与逐条规则归因变化；预演返回绑定规则快照、建议集合与告警集合的令牌。
+        正式应用会在<strong>同一事务</strong>内复核该令牌——任一输入在预演后发生变化即以 409 拒绝且规则不被修改；
+        令牌一致才逐条执行并重新审计校验（勾选的关系必须全部消除、不得新增可能改变结果的关系、不得新增被遮蔽规则），
         <strong>任一校验失败自动回滚</strong>。修复只改规则，不回溯改写任何 live/replay 历史决定。</p>
       <div class="toolbar">
         <button class="btn primary" id="btn-rem-refresh">🔍 重新生成建议</button>
@@ -270,8 +273,14 @@
       <div id="rem-unsupported"></div>
       <div class="toolbar" style="margin-top:12px;align-items:flex-end">
         <input id="rem-note" placeholder="修复说明（可选），如：清理死规则与重复规则" style="flex:1;min-width:260px">
-        <button class="btn primary" id="btn-rem-apply">✔ 应用勾选建议（单事务，失败自动回滚）</button>
+        <button class="btn" id="btn-rem-preview">🧪 影响预演（不落库回放）</button>
+        <button class="btn primary" id="btn-rem-apply">✔ 应用勾选建议（需先预演）</button>
       </div>
+    </div>
+
+    <div class="card" style="margin-top:16px;display:none" id="rem-preview-card">
+      <h2>影响预演（草稿规则 · 不落库回放）</h2>
+      <div id="rem-preview"></div>
     </div>
 
     <div class="card" style="margin-top:16px;display:none" id="rem-result-card">

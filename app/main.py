@@ -4,6 +4,7 @@
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import urllib.error
 import urllib.request
@@ -38,7 +39,7 @@ from .engine import (
 from .remediation import (
     diff_audits,
     generate_suggestions,
-    relation_fingerprint,
+    plan_draft,
     validate_remediation,
 )
 
@@ -363,7 +364,7 @@ def rule_audit(rule_id: Optional[int] = None):
 
 
 # ---------------------------------------------------------------------------
-# 规则审计修复工作台：确定性建议、单事务应用（失败自动回滚）、历史与撤销
+# 规则审计修复工作台：确定性建议、影响预演（不落库）、单事务应用（失败自动回滚）
 # ---------------------------------------------------------------------------
 
 def _audit_and_suggestions(conn):
@@ -391,6 +392,149 @@ def rule_audit_suggestions():
             "pending_count": len(sugg["suggestions"]),
             "suggestions": sugg["suggestions"],
             "unsupported": sugg["unsupported"],
+        }
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# 影响预演：草稿规则 + 从零回放 + 绑定令牌（全部只读计算，不落库、不转发）
+# ---------------------------------------------------------------------------
+
+_TOKEN_RULE_COLS = (
+    "id", "name", "description", "action", "priority", "cooldown_seconds",
+    "match_device", "match_batch", "match_level", "time_start", "time_end",
+    "date_start", "date_end", "enabled",
+)
+_TOKEN_ALERT_COLS = (
+    "id", "seq", "device_id", "batch_id", "level", "alert_type", "ts",
+)
+
+
+def _preview_token(rules_rows, ordered_ids: list[str], alert_rows) -> str:
+    """预演令牌：绑定规则快照 + 建议集合（确定性应用顺序）+ 告警集合的内容哈希。
+
+    纯内容寻址、无状态不落库：任一输入变化都会得到不同令牌；正式应用在
+    同一事务内用当前数据重算并比对，不一致即以 409 拒绝。
+    """
+    payload = {
+        "rules": [{k: r[k] for k in _TOKEN_RULE_COLS} for r in rules_rows],
+        "suggestion_ids": list(ordered_ids),
+        "alerts": [{k: a[k] for k in _TOKEN_ALERT_COLS} for a in alert_rows],
+    }
+    canonical = json.dumps(payload, ensure_ascii=False, sort_keys=True,
+                           separators=(",", ":"))
+    return "pv1." + hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _replay_in_memory(rules: list[RuleView], alert_rows) -> list[dict]:
+    """用给定规则对全部已注入告警按注入顺序从零回放（全新冷却状态）。
+
+    与 ``POST /api/replays`` 语义一致，但只在内存中求值：不落库、不转发。
+    """
+    state = EvalState()
+    results = []
+    for row in alert_rows:
+        alert = _alert_dict(row)
+        alert["ts"] = datetime.fromisoformat(alert["ts"])
+        results.append(evaluate(alert, rules, state))
+    return results
+
+
+def _decision_brief(result: dict) -> dict:
+    return {k: result[k] for k in ("decision", "rule_id", "rule_name", "reason")}
+
+
+@app.post("/api/rule-audit/remediations/preview")
+def preview_rule_remediation(payload: dict = Body(...)):
+    """影响预演：不落库生成草稿规则，并分别用当前/草稿规则从零回放全部已注入告警。
+
+    流程（全部只读计算）：按与正式应用完全相同的确定性顺序在内存中应用勾选
+    建议得到草稿规则 → 用当前规则与草稿规则各自从**全新冷却状态**按注入顺序
+    重放全部已注入告警 → 汇总放行→抑制、抑制→放行与逐条规则归因变化。
+    返回绑定规则快照、建议集合与告警集合的 ``preview_token``，正式应用必须
+    携带该令牌并在同一事务内复核。无已注入告警时返回零变化预演（仍可应用）。
+    """
+    selected_ids = (payload or {}).get("suggestion_ids")
+    if not isinstance(selected_ids, list) or not selected_ids:
+        raise HTTPException(400, "suggestion_ids 必须是非空数组")
+    if not all(isinstance(s, str) for s in selected_ids):
+        raise HTTPException(400, "suggestion_ids 必须全部是字符串")
+
+    conn = db.get_conn()
+    try:
+        all_rules, before, sugg = _audit_and_suggestions(conn)
+        by_id = {s["id"]: s for s in sugg["suggestions"]}
+        unknown = [sid for sid in selected_ids if sid not in by_id]
+        if unknown:
+            raise HTTPException(
+                409, "建议已失效（规则可能已变更），请刷新后重试: "
+                + ", ".join(str(s) for s in unknown)
+            )
+        try:
+            plan = plan_draft(all_rules, before, sugg["suggestions"], selected_ids)
+        except ValueError as exc:
+            raise HTTPException(409, f"草稿规则生成失败：{exc}")
+        errors = validate_remediation(before, plan["audit"], plan["ordered"])
+        diff = diff_audits(before, plan["audit"])
+
+        rules_rows = conn.execute("SELECT * FROM rules ORDER BY id").fetchall()
+        alert_rows = conn.execute("SELECT * FROM alerts ORDER BY seq").fetchall()
+        ordered_ids = [s["id"] for s in plan["ordered"]]
+        token = _preview_token(rules_rows, ordered_ids, alert_rows)
+
+        current_views = ordered_rules([dict(r) for r in rules_rows])
+        draft_views = ordered_rules(plan["rules"])
+        before_results = _replay_in_memory(current_views, alert_rows)
+        after_results = _replay_in_memory(draft_views, alert_rows)
+
+        rows_out = []
+        n_p2s = n_s2p = n_attr = 0
+        for row, b, a in zip(alert_rows, before_results, after_results):
+            transition = None
+            if b["decision"] == "pass" and a["decision"] == "suppress":
+                transition = "pass_to_suppress"
+                n_p2s += 1
+            elif b["decision"] == "suppress" and a["decision"] == "pass":
+                transition = "suppress_to_pass"
+                n_s2p += 1
+            elif b["rule_id"] != a["rule_id"]:
+                transition = "attribution"
+                n_attr += 1
+            rows_out.append({
+                "alert": {
+                    "id": row["id"], "seq": row["seq"],
+                    "device_id": row["device_id"], "batch_id": row["batch_id"],
+                    "level": row["level"], "alert_type": row["alert_type"],
+                    "message": row["message"], "ts": row["ts"],
+                },
+                "before": _decision_brief(b),
+                "after": _decision_brief(a),
+                "changed": transition is not None,
+                "transition": transition,
+            })
+        changed = n_p2s + n_s2p + n_attr
+        return {
+            "preview_token": token,
+            "suggestion_ids": ordered_ids,
+            "applicable": not errors,
+            "validation_errors": errors,
+            "draft": {
+                "results": plan["results"],
+                "applied_count": sum(1 for r in plan["results"] if r["status"] == "applied"),
+                "skipped_count": sum(1 for r in plan["results"] if r["status"] == "skipped"),
+                "rules": plan["rules"],
+                "audit_diff": diff,
+            },
+            "impact": {
+                "alert_count": len(alert_rows),
+                "changed_count": changed,
+                "pass_to_suppress": n_p2s,
+                "suppress_to_pass": n_s2p,
+                "attribution_changed": n_attr,
+                "unchanged": len(alert_rows) - changed,
+                "rows": rows_out,
+            },
         }
     finally:
         conn.close()
@@ -425,66 +569,71 @@ def _apply_remediation_op(conn, op: dict) -> None:
 
 @app.post("/api/rule-audit/remediations")
 def apply_rule_remediation(payload: dict = Body(...)):
-    """在同一事务中应用勾选的修复建议草稿，并输出应用前后审计关系变化。
+    """在同一事务中复核预演令牌并应用勾选的修复建议草稿。
 
-    流程：快照规则表 → 记录应用前审计 → 按审计关系的确定性顺序逐条应用
-    （某条建议针对的关系若已被本次先前的修复消除，则标记为跳过）→ 重新
-    审计并校验（勾选的关系必须全部消除、不得新增可能改变结果的关系、
-    不得新增被完全遮蔽的规则）→ **任一校验失败自动回滚**；全部通过则
-    同事务写入修复记录并提交。只改规则，不回溯改写任何 live/replay 历史。
+    必须携带最近一次「影响预演」返回的 ``preview_token``。事务内流程：
+    重新生成建议并按确定性顺序排列 → 用当前规则表与告警集合重算令牌并比对
+    （规则快照 / 建议集合 / 告警集合任一已变化 → **409 拒绝且不修改任何
+    规则**，需重新预演）→ 令牌一致才快照规则表、逐条应用（某条建议针对的
+    关系若已被本次先前的修复消除，则标记为跳过）→ 重新审计并校验（勾选的
+    关系必须全部消除、不得新增可能改变结果的关系、不得新增被完全遮蔽的
+    规则）→ **任一校验失败自动回滚**；全部通过则同事务写入修复记录并提交，
+    响应中给出应用前后审计关系变化。只改规则，不回溯改写任何 live/replay
+    历史。
     """
     selected_ids = (payload or {}).get("suggestion_ids")
     if not isinstance(selected_ids, list) or not selected_ids:
         raise HTTPException(400, "suggestion_ids 必须是非空数组")
     if not all(isinstance(s, str) for s in selected_ids):
         raise HTTPException(400, "suggestion_ids 必须全部是字符串")
+    preview_token = (payload or {}).get("preview_token")
+    if not isinstance(preview_token, str) or not preview_token:
+        raise HTTPException(400, "缺少 preview_token：请先执行「影响预演」再正式应用")
     note = str((payload or {}).get("note", "")).strip()[:200]
 
     conn = db.get_conn()
     try:
-        all_rules, before, sugg = _audit_and_suggestions(conn)
-        by_id = {s["id"]: s for s in sugg["suggestions"]}
-        unknown = [sid for sid in selected_ids if sid not in by_id]
-        if unknown:
-            raise HTTPException(
-                409, "建议已失效（规则可能已变更），请刷新后重试: "
-                + ", ".join(str(s) for s in unknown)
-            )
-        wanted = set(selected_ids)
-        # 审计结果顺序即确定性应用顺序（按双方规则 id 稳定排序）
-        ordered = [s for s in sugg["suggestions"] if s["id"] in wanted]
-
-        snapshot = json.dumps(
-            [dict(r) for r in conn.execute("SELECT * FROM rules ORDER BY id").fetchall()],
-            ensure_ascii=False,
-        )
-
-        conn.execute("BEGIN")
+        conn.execute("BEGIN IMMEDIATE")
         try:
-            results = []
-            working = before
-            for s in ordered:
-                fp = s["relation_fingerprint"]
-                current_fps = {relation_fingerprint(o) for o in working["overlaps"]}
-                if fp not in current_fps:
-                    results.append({
-                        "suggestion_id": s["id"], "kind": s["kind"],
-                        "status": "skipped",
-                        "reason": "针对的审计关系已被本次草稿中先前的修复消除",
-                    })
+            all_rules, before, sugg = _audit_and_suggestions(conn)
+            by_id = {s["id"]: s for s in sugg["suggestions"]}
+            unknown = [sid for sid in selected_ids if sid not in by_id]
+            if unknown:
+                raise HTTPException(
+                    409, "建议已失效（规则可能已变更），请重新预演: "
+                    + ", ".join(str(s) for s in unknown)
+                )
+            try:
+                plan = plan_draft(all_rules, before, sugg["suggestions"], selected_ids)
+            except ValueError as exc:
+                raise HTTPException(409, f"修复操作校验失败：{exc}")
+            ordered = plan["ordered"]
+            results = plan["results"]
+
+            # 同一事务内复核预演令牌：任一输入在预演后变化即拒绝，规则不被修改
+            rules_rows = conn.execute("SELECT * FROM rules ORDER BY id").fetchall()
+            alert_rows = conn.execute("SELECT * FROM alerts ORDER BY seq").fetchall()
+            expected = _preview_token(
+                rules_rows, [s["id"] for s in ordered], alert_rows
+            )
+            if preview_token != expected:
+                raise HTTPException(
+                    409, "预演令牌已失效：规则、建议或告警集合在预演后已变化，"
+                         "规则未被修改，请重新执行「影响预演」"
+                )
+
+            snapshot = json.dumps(
+                [dict(r) for r in rules_rows], ensure_ascii=False,
+            )
+            for s, res in zip(ordered, results):
+                if res["status"] != "applied":
                     continue
                 for op in s["ops"]:
                     _apply_remediation_op(conn, op)
-                rows = conn.execute(
-                    "SELECT * FROM rules ORDER BY priority, id"
-                ).fetchall()
-                working = audit_rules([dict(r) for r in rows])
-                results.append({
-                    "suggestion_id": s["id"], "kind": s["kind"],
-                    "status": "applied",
-                    "reason": "已应用：" + "；".join(s["ops_text"]),
-                })
-            after = working
+            rows = conn.execute(
+                "SELECT * FROM rules ORDER BY priority, id"
+            ).fetchall()
+            after = audit_rules([dict(r) for r in rows])
             errors = validate_remediation(before, after, ordered)
             if errors:
                 raise HTTPException(409, "修复校验失败，已自动回滚：" + "；".join(errors))

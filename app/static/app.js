@@ -27,6 +27,7 @@ let state = {
     suggestions: [], unsupported: [], meta: null,
     history: [], canUndoId: null, lastResult: null,
     selected: new Set(),
+    preview: null,   // {token, ids: [...], result} — 影响预演结果与绑定令牌
   },
 };
 
@@ -754,7 +755,7 @@ function renderAudit() {
 }
 
 // ---------------------------------------------------------------------------
-// Tab 3.6: 审计修复工作台（确定性建议 → 勾选草稿 → 单事务应用 → 可撤销）
+// Tab 3.6: 审计修复工作台（确定性建议 → 勾选草稿 → 影响预演 → 单事务应用 → 可撤销）
 // ---------------------------------------------------------------------------
 
 async function loadRemData() {
@@ -767,10 +768,12 @@ async function loadRemData() {
   state.remediate.unsupported = s.unsupported || [];
   state.remediate.history = h.runs || [];
   state.remediate.canUndoId = h.can_undo_id;
-  // 规则可能已变化：丢弃已失效的勾选
+  // 规则可能已变化：丢弃已失效的勾选与预演令牌
   const ids = new Set(state.remediate.suggestions.map((x) => x.id));
   state.remediate.selected = new Set([...state.remediate.selected].filter((x) => ids.has(x)));
+  state.remediate.preview = null;
   renderRemSuggestions();
+  renderRemPreview();
   renderRemHistory();
 }
 
@@ -817,16 +820,138 @@ function renderRemSuggestions() {
     : "";
 }
 
-async function applyRemediations() {
-  const ids = state.remediate.suggestions
+function remSelectedIds() {
+  return state.remediate.suggestions
     .filter((s) => state.remediate.selected.has(s.id))
     .map((s) => s.id);
+}
+
+async function previewRemediations() {
+  const ids = remSelectedIds();
+  if (!ids.length) return toast("请先勾选要预演的修复建议", true);
+  try {
+    const r = await api("/api/rule-audit/remediations/preview", {
+      method: "POST",
+      body: JSON.stringify({ suggestion_ids: ids }),
+    });
+    state.remediate.preview = { token: r.preview_token, ids: r.suggestion_ids, result: r };
+    renderRemPreview();
+    const im = r.impact;
+    toast(`预演完成：回放 ${im.alert_count} 条告警，${im.changed_count} 条有变化` +
+      `（放行→抑制 ${im.pass_to_suppress} · 抑制→放行 ${im.suppress_to_pass} · 归因变化 ${im.attribution_changed}）`);
+  } catch (e) { fail(e); }
+}
+
+function transitionBadge(t) {
+  if (t === "pass_to_suppress") return '<span class="pv-transition pv-t-p2s">放行 → 抑制</span>';
+  if (t === "suppress_to_pass") return '<span class="pv-transition pv-t-s2p">抑制 → 放行</span>';
+  if (t === "attribution") return '<span class="pv-transition pv-t-attr">⇄ 归因变化</span>';
+  return '<span class="no-diff">一致</span>';
+}
+
+function renderRemPreview() {
+  const pv = state.remediate.preview;
+  const card = $("#rem-preview-card");
+  if (!pv) { card.style.display = "none"; return; }
+  card.style.display = "";
+  const r = pv.result;
+  const d = r.draft, im = r.impact, diff = d.audit_diff;
+  const bt = diff.before_totals, at = diff.after_totals;
+
+  const validation = r.validation_errors.length
+    ? `<div class="rem-preview-errors"><b>✖ 草稿未通过应用校验，正式应用将自动回滚：</b><br>` +
+      r.validation_errors.map(esc).join("<br>") + `</div>`
+    : '<span class="badge pass">✔ 应用校验通过，可正式应用</span>';
+
+  const resultsList = d.results.map((x) => `<li>
+    <span class="badge ${x.status === "applied" ? "pass" : ""}">${x.status === "applied" ? "✔ 应用" : "↷ 跳过"}</span>
+    <code>${esc(x.suggestion_id)}</code>
+    <div style="color:var(--muted);margin-top:2px">${esc(x.reason)}</div>
+  </li>`).join("");
+
+  const draftRules = d.rules.map((rule) => {
+    const m = ruleMatches(rule);
+    return `<div class="snap-rule"${rule.enabled ? "" : ' style="opacity:0.5"'}>
+      <div class="top">
+        <b>#${rule.id} ${esc(rule.name)}</b>
+        ${rule.action === "pass" ? '<span class="decision pass">pass</span>' : '<span class="decision suppress">suppress</span>'}
+        <span class="badge">优先级 ${rule.priority}</span>
+        ${rule.cooldown_seconds ? `<span class="badge">冷却 ${rule.cooldown_seconds}s</span>` : ""}
+        ${rule.enabled ? "" : '<span class="badge suppress">停用</span>'}
+      </div>
+      <div class="conds">设备 ${esc(m.dev)} · 批次 ${esc(m.batch)} · 级别 ${esc(m.lvl)} · 时段 ${esc(m.time)} · 日期 ${esc(m.dates)}</div>
+    </div>`;
+  }).join("") || '<p class="empty">草稿规则为空</p>';
+
+  const onlyChanged = $("#rem-preview-only-changed")?.checked;
+  const impactRows = im.rows.filter((x) => !onlyChanged || x.changed).map((x) => {
+    const a = x.alert;
+    return `<tr class="${x.changed ? "row-changed" : ""}">
+      <td>${a.seq}</td>
+      <td>${esc(a.device_id || "-")}<br><span style="color:var(--muted)">${esc(a.batch_id || "-")}</span></td>
+      <td>${levelBadge(a.level)}<br><span style="color:var(--muted)">${esc(a.alert_type || "-")}</span></td>
+      <td style="white-space:nowrap">${esc(a.ts)}</td>
+      <td>${decisionCell(x.before)}</td>
+      <td>${decisionCell(x.after)}</td>
+      <td>${transitionBadge(x.transition)}</td>
+    </tr>`;
+  }).join("") || `<tr><td colspan="7" class="empty">${im.alert_count
+    ? "没有发生变化的告警"
+    : "当前没有已注入告警——零变化预演，仍可正式应用"}</td></tr>`;
+
+  $("#rem-preview").innerHTML = `
+    <p class="hint">预演令牌 <code>${esc(pv.token.slice(0, 23))}…</code> 绑定了当前规则快照、${pv.ids.length} 条勾选建议与
+      ${im.alert_count} 条已注入告警；正式应用会在<strong>同一事务</strong>内复核该令牌，
+      任一输入在预演后发生变化都会被 409 拒绝且规则不被修改。预演本身不落库、不转发。</p>
+    <div class="toolbar" style="align-items:center">
+      ${validation}
+      <span class="badge">草稿：应用 ${d.applied_count} 条 / 跳过 ${d.skipped_count} 条</span>
+      <span class="badge">审计关系 ${bt.overlaps} → ${at.overlaps} 组（消除 ${diff.removed_count} · 新增 ${diff.added_count}）</span>
+    </div>
+    <div class="toolbar" style="align-items:center">
+      <span class="badge suppress">放行 → 抑制：${im.pass_to_suppress}</span>
+      <span class="badge pass">抑制 → 放行：${im.suppress_to_pass}</span>
+      <span class="badge">归因变化：${im.attribution_changed}</span>
+      <span class="badge">一致：${im.unchanged}</span>
+      <label class="checkbox" style="margin:0"><input type="checkbox" id="rem-preview-only-changed"${onlyChanged ? " checked" : ""}> 仅看变化</label>
+    </div>
+    <div class="rem-diff-grid">
+      <div>
+        <div class="audit-side-title">草稿执行计划（与正式应用相同的确定性顺序）</div>
+        <ul class="rem-diff-list">${resultsList}</ul>
+        <div class="audit-side-title" style="margin-top:10px">草稿规则（${d.rules.length} 条，不落库）</div>
+        <div class="snapshot" style="max-height:280px">${draftRules}</div>
+      </div>
+      <div>
+        <div class="audit-side-title">逐条回放对比（当前规则 vs 草稿规则，均从零冷却状态按注入顺序重放）</div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>#</th><th>设备/批次</th><th>级别/类型</th><th>时间</th><th>当前规则</th><th>草稿规则</th><th>变化</th></tr></thead>
+            <tbody>${impactRows}</tbody>
+          </table>
+        </div>
+      </div>
+    </div>`;
+}
+
+async function applyRemediations() {
+  const ids = remSelectedIds();
   if (!ids.length) return toast("请先勾选要应用的修复建议", true);
-  if (!confirm(`在同一事务中应用 ${ids.length} 条修复建议？\n系统会逐条执行并重新审计校验，任一校验失败将自动回滚，规则不会产生任何变化。`)) return;
+  const pv = state.remediate.preview;
+  const selectionMatches = pv && pv.ids.length === ids.length &&
+    pv.ids.every((x) => state.remediate.selected.has(x));
+  if (!selectionMatches) {
+    return toast("正式应用前请先对当前勾选执行「🧪 影响预演」", true);
+  }
+  if (!confirm(`在同一事务中复核预演令牌并应用 ${ids.length} 条修复建议？\n若规则、建议或告警集合在预演后已变化，本次应用将被 409 拒绝且不修改任何规则；校验失败同样自动回滚。`)) return;
   try {
     const r = await api("/api/rule-audit/remediations", {
       method: "POST",
-      body: JSON.stringify({ suggestion_ids: ids, note: $("#rem-note").value.trim() }),
+      body: JSON.stringify({
+        suggestion_ids: ids,
+        note: $("#rem-note").value.trim(),
+        preview_token: pv.token,
+      }),
     });
     $("#rem-note").value = "";
     state.remediate.selected.clear();
@@ -1157,9 +1282,13 @@ async function refreshAuditIfLoaded() {
 // 勾选修复建议（事件委托：卡片重渲染后仍然生效）
 document.addEventListener("change", (e) => {
   const t = e.target;
+  if (t.id === "rem-preview-only-changed") { renderRemPreview(); return; }
   if (!t.dataset || !t.dataset.remSelect) return;
   if (t.checked) state.remediate.selected.add(t.dataset.remSelect);
   else state.remediate.selected.delete(t.dataset.remSelect);
+  // 勾选集合变化后，旧预演令牌不再匹配当前草稿，需重新预演
+  state.remediate.preview = null;
+  renderRemPreview();
   const card = document.querySelector(`[data-rem-card="${CSS.escape(t.dataset.remSelect)}"]`);
   if (card) card.classList.toggle("selected", t.checked);
 });
@@ -1211,13 +1340,18 @@ function bind() {
   });
   $("#btn-rem-refresh").addEventListener("click", () =>
     loadRemData().then(() => toast("建议已按当前启用规则重新生成")).catch(fail));
+  $("#btn-rem-preview").addEventListener("click", previewRemediations);
   $("#btn-rem-apply").addEventListener("click", applyRemediations);
   $("#btn-rem-all").addEventListener("click", () => {
     state.remediate.suggestions.forEach((s) => state.remediate.selected.add(s.id));
+    state.remediate.preview = null;
+    renderRemPreview();
     renderRemSuggestions();
   });
   $("#btn-rem-none").addEventListener("click", () => {
     state.remediate.selected.clear();
+    state.remediate.preview = null;
+    renderRemPreview();
     renderRemSuggestions();
   });
   $("#btn-replay").addEventListener("click", doReplay);
